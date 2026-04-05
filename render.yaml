@@ -1,0 +1,21 @@
+services:
+  - type: worker          # background process — no HTTP port needed
+    name: nutribot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free            # upgrade to starter for persistent disk
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false       # set manually in Render dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: USER_TIMEZONE
+        value: Europe/London
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: nutribot-data
+      mountPath: /data
+      sizeGB: 1
