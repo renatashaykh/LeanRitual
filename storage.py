@@ -1,9 +1,9 @@
 """
-storage.py — Lightweight JSON-based daily log.
+storage.py — Daily log + user profile persistence.
 
-Each user gets a file: data/{user_id}/{YYYY-MM-DD}.json
-On Railway/Render with ephemeral disks this resets on redeploy,
-which is fine for a single-user bot; swap for Redis/SQLite for persistence.
+File layout:
+  data/{user_id}/profile.json      — onboarding answers, persists forever
+  data/{user_id}/{YYYY-MM-DD}.json — daily meal log
 """
 
 import json
@@ -14,6 +14,48 @@ from pathlib import Path
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
+
+# ── User profile (collected during onboarding) ────────────────────────────────
+
+@dataclass
+class UserProfile:
+    age: int = 0
+    sex: str = ""           # "male" / "female"
+    weight_kg: float = 0.0
+    goal: str = ""          # "fat_loss" / "muscle_gain" / "maintain"
+
+    def is_complete(self) -> bool:
+        return all([self.age, self.sex, self.weight_kg, self.goal])
+
+
+def _profile_path(user_id: int) -> Path:
+    path = DATA_DIR / str(user_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "profile.json"
+
+
+def get_profile(user_id: int) -> UserProfile | None:
+    path = _profile_path(user_id)
+    if path.exists():
+        with open(path) as f:
+            data = json.load(f)
+        return UserProfile(**data)
+    return None
+
+
+def save_profile(user_id: int, profile: UserProfile) -> None:
+    path = _profile_path(user_id)
+    with open(path, "w") as f:
+        json.dump(asdict(profile), f, indent=2)
+
+
+def delete_profile(user_id: int) -> None:
+    path = _profile_path(user_id)
+    if path.exists():
+        path.unlink()
+
+
+# ── Daily meal log ─────────────────────────────────────────────────────────────
 
 @dataclass
 class DailyLog:
@@ -50,7 +92,6 @@ class DailyLog:
         )
 
     def remaining(self, targets: dict) -> dict:
-        """Return how much of each macro is still left to hit targets."""
         return {
             "kcal": targets["kcal_max"] - self.total_kcal,
             "protein": targets["protein_max"] - self.total_protein,
