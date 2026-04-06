@@ -23,6 +23,7 @@ class UserProfile:
     sex: str = ""           # "male" / "female"
     weight_kg: float = 0.0
     goal: str = ""          # "fat_loss" / "muscle_gain" / "maintain"
+    language: str = "en"    # "en" / "ru"
 
     def is_complete(self) -> bool:
         return all([self.age, self.sex, self.weight_kg, self.goal])

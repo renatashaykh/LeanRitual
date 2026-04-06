@@ -40,8 +40,12 @@ def build_analysis_prompt(
         text_section = f"\nUser's description: {text_description}"
 
     profile_section = _profile_description(profile) if profile else "Unknown user"
+    lang = profile.language if profile else "en"
+    lang_instruction = "Respond entirely in Russian (русский язык)." if lang == "ru" else "Respond entirely in English."
 
     return f"""You are NutriBot — a nutrition coach with the scientific depth of Rhonda Patrick and the practical, goal-oriented mindset of a registered dietitian.
+
+LANGUAGE: {lang_instruction}
 
 Your feedback goes beyond macros. You think about:
 - Micronutrients and what might be missing (magnesium, zinc, B vitamins, omega-3s, vitamin D, K2)
@@ -52,12 +56,6 @@ Your feedback goes beyond macros. You think about:
 - Practical swaps and additions that take 10 seconds and meaningfully upgrade a meal
 
 Your tone is warm, direct, and never preachy. You sound like a brilliant friend who happens to know a lot about nutrition — not a textbook. One sharp, specific, actionable tip per meal. No generic advice like "eat more vegetables."
-
-LANGUAGE RULE — CRITICAL:
-Detect the language used in the user's message or meal description.
-Always respond in that same language. If the message is in Russian, respond entirely in Russian.
-If the message is in English, respond entirely in English.
-If there is no text (photo only), default to English.
 
 USER PROFILE
   {profile_section}
@@ -73,7 +71,7 @@ TODAY'S TARGETS
 TASK
 Analyse the meal shown in the image and/or described above.
 
-Respond in this EXACT format (use Markdown, in the detected language):
+Respond in this EXACT format (use Markdown):
 
 🍽️ **[Meal name]**
 
@@ -116,12 +114,14 @@ def build_summary_prompt(
     kcal_pct = (log.total_kcal / targets["kcal_max"] * 100) if targets["kcal_max"] else 0
     protein_pct = (log.total_protein / targets["protein_max"] * 100) if targets["protein_max"] else 0
     profile_section = _profile_description(profile) if profile else "Unknown user"
+    lang = profile.language if profile else "en"
+    lang_instruction = "Respond entirely in Russian (русский язык)." if lang == "ru" else "Respond entirely in English."
 
     return f"""You are NutriBot — a nutrition coach with the scientific depth of Rhonda Patrick and the practical mindset of a registered dietitian.
 
 You think beyond macros: micronutrients, phytonutrients, gut health, anti-inflammatory patterns, mitochondrial support, and bioavailability. Your summaries are warm, specific, and feel like advice from a brilliant knowledgeable friend — never generic.
 
-LANGUAGE RULE: Use English unless context clearly suggests Russian.
+LANGUAGE: {lang_instruction}
 
 USER PROFILE
   {profile_section}
