@@ -25,7 +25,7 @@ from telegram.ext import (
 
 from storage import (
     DailyLog, UserProfile,
-    get_today_log, save_log, reset_log,
+    get_today_log, save_log, reset_log, undo_last_meal,
     get_profile, save_profile, delete_profile,
 )
 from targets import (
@@ -131,6 +131,10 @@ def t(key: str, lang: str) -> str:
         "updated":          {"en": "✅ Updated!", "ru": "✅ Обновлено!"},
         "profile_deleted":  {"en": "Profile deleted. Send /start to set up a new one.",
                              "ru": "Профиль удалён. Отправьте /start для настройки нового."},
+        "undo_success":     {"en": "↩️ Removed: *{label}* — {kcal:.0f} kcal | P {protein:.0f}g | C {carbs:.0f}g | F {fat:.0f}g\n\nRunning total: {total_kcal:.0f} kcal | {total_protein:.0f}g protein",
+                             "ru": "↩️ Удалено: *{label}* — {kcal:.0f} ккал | Б {protein:.0f}г | У {carbs:.0f}г | Ж {fat:.0f}г\n\nИтого за день: {total_kcal:.0f} ккал | {total_protein:.0f}г белка"},
+        "undo_empty":       {"en": "Nothing to undo — no meals logged yet today.",
+                             "ru": "Нечего отменять — сегодня ещё нет записей."},
     }
     return strings.get(key, {}).get(lang, strings.get(key, {}).get("en", key))
 
@@ -152,12 +156,12 @@ def main_keyboard(lang: str = "en") -> ReplyKeyboardMarkup:
         return ReplyKeyboardMarkup([
             [KeyboardButton("📊 Сводка за день"), KeyboardButton("🏋️ День тренировки")],
             [KeyboardButton("😴 День отдыха"),    KeyboardButton("🔄 Сбросить день")],
-            [KeyboardButton("👤 Мой профиль")],
+            [KeyboardButton("↩️ Отменить запись"), KeyboardButton("👤 Мой профиль")],
         ], resize_keyboard=True)
     return ReplyKeyboardMarkup([
         [KeyboardButton("📊 Daily Summary"), KeyboardButton("🏋️ Training Day")],
         [KeyboardButton("😴 Rest Day"),      KeyboardButton("🔄 Reset Today")],
-        [KeyboardButton("👤 My Profile")],
+        [KeyboardButton("↩️ Undo Last Entry"), KeyboardButton("👤 My Profile")],
     ], resize_keyboard=True)
 
 
@@ -489,6 +493,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     rest_texts      = {"😴 Rest Day", "😴 День отдыха"}
     reset_texts     = {"🔄 Reset Today", "🔄 Сбросить день"}
 
+    undo_texts = {"↩️ Undo Last Entry", "↩️ Отменить запись"}
+
     if text in summary_texts:
         if not profile or not profile.is_complete():
             await update.message.reply_text(t("setup_first", lang))
@@ -528,6 +534,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in reset_texts:
         reset_log(user_id)
         await update.message.reply_text(t("log_reset", lang), reply_markup=main_keyboard(lang))
+        return
+
+    if text in undo_texts:
+        removed = undo_last_meal(user_id)
+        if not removed:
+            await update.message.reply_text(t("undo_empty", lang), reply_markup=main_keyboard(lang))
+        else:
+            log = get_today_log(user_id)
+            label = removed.get("label") or f"Meal {removed.get('meal_num', '?')}"
+            msg = t("undo_success", lang).format(
+                label=label,
+                kcal=removed["kcal"],
+                protein=removed["protein"],
+                carbs=removed["carbs"],
+                fat=removed["fat"],
+                total_kcal=log.total_kcal,
+                total_protein=log.total_protein,
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard(lang))
         return
 
     # Meal logging

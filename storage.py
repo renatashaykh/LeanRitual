@@ -127,3 +127,23 @@ def reset_log(user_id: int) -> None:
     path = _log_path(user_id)
     if path.exists():
         path.unlink()
+
+
+def undo_last_meal(user_id: int) -> dict | None:
+    """
+    Remove the most recent meal from today's log.
+    Returns the removed meal dict, or None if log was empty.
+    """
+    log = get_today_log(user_id)
+    if not log.meals:
+        return None
+
+    removed = log.meals.pop()
+    log.meal_count -= 1
+    log.total_kcal    -= removed["kcal"]
+    log.total_protein -= removed["protein"]
+    log.total_carbs   -= removed["carbs"]
+    log.total_fat     -= removed["fat"]
+
+    save_log(user_id, log)
+    return removed
