@@ -27,6 +27,7 @@ from storage import (
     DailyLog, UserProfile,
     get_today_log, save_log, reset_log, undo_last_meal,
     get_profile, save_profile, delete_profile,
+    get_trial, record_and_check_trial, mark_paid,
 )
 from targets import (
     get_targets, DAY_TYPE_TRAINING, DAY_TYPE_REST,
@@ -135,6 +136,24 @@ def t(key: str, lang: str) -> str:
                              "ru": "↩️ Удалено: *{label}* — {kcal:.0f} ккал | Б {protein:.0f}г | У {carbs:.0f}г | Ж {fat:.0f}г\n\nИтого за день: {total_kcal:.0f} ккал | {total_protein:.0f}г белка"},
         "undo_empty":       {"en": "Nothing to undo — no meals logged yet today.",
                              "ru": "Нечего отменять — сегодня ещё нет записей."},
+        "trial_warning":    {"en": "⚠️ *{days} free day(s) remaining* in your trial.",
+                             "ru": "⚠️ *Осталось {days} бесплатных дней* пробного периода."},
+        "paywall":          {"en": (
+                                "🔒 *Your 7-day free trial has ended.*\n\n"
+                                "To keep using NutriBot, send *$2 USD* via:\n"
+                                "• PayPal: `renatashaykh@gmail.com`\n"
+                                "• Or ask to be whitelisted\n\n"
+                                "📋 *Your Telegram ID:* `{user_id}`\n"
+                                "Send your ID + payment confirmation and you'll be unlocked within 24h."
+                            ),
+                             "ru": (
+                                "🔒 *Ваш 7-дневный пробный период завершён.*\n\n"
+                                "Чтобы продолжить использование NutriBot, отправьте *$2 USD*:\n"
+                                "• PayPal: `renatashaykh@gmail.com`\n"
+                                "• Или попросите добавить вас в белый список\n\n"
+                                "📋 *Ваш Telegram ID:* `{user_id}`\n"
+                                "Отправьте ваш ID и подтверждение оплаты — разблокировка в течение 24ч."
+                            )},
     }
     return strings.get(key, {}).get(lang, strings.get(key, {}).get("en", key))
 
@@ -315,6 +334,21 @@ async def onboard_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ── Edit profile conversation ─────────────────────────────────────────────────
+async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command: /whitelist <user_id> — mark a user as paid."""
+    if not ALLOWED_USERS or update.effective_user.id not in ALLOWED_USERS:
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /whitelist <telegram_user_id>")
+        return
+    try:
+        target_id = int(context.args[0])
+        mark_paid(target_id)
+        await update.message.reply_text(f"✅ User {target_id} has been unlocked.")
+    except ValueError:
+        await update.message.reply_text("Invalid user ID.")
+
+
 async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Entry point: show current profile then offer edit options."""
     if not is_allowed(update.effective_user.id):
@@ -560,6 +594,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(t("setup_first", lang))
         return
 
+    # ── Trial / paywall check ─────────────────────────────────────────────────
+    is_blocked, trial = record_and_check_trial(user_id)
+    if is_blocked:
+        await update.message.reply_text(
+            t("paywall", lang).format(user_id=user_id),
+            parse_mode="Markdown",
+        )
+        return
+    # Warn when 1 or 2 days remaining
+    if trial.days_remaining() in (1, 2) and not trial.paid:
+        await update.message.reply_text(
+            t("trial_warning", lang).format(days=trial.days_remaining()),
+            parse_mode="Markdown",
+        )
+
     image_b64 = None
     if update.message.photo:
         photo = update.message.photo[-1]
@@ -629,6 +678,7 @@ def main() -> None:
 
     app.add_handler(onboarding)
     app.add_handler(edit_profile)
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(
         MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, handle_message)
     )
