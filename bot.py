@@ -747,7 +747,32 @@ async def handle_weekly_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
     fitness_profile.weeks_completed += 1
     save_fitness_profile(user_id, fitness_profile)
 
-    await status.edit_text(plan_text, parse_mode="Markdown")
+    # Telegram max message length is 4096 chars — split if needed
+    try:
+        if len(plan_text) <= 4000:
+            await status.edit_text(plan_text, parse_mode="Markdown")
+        else:
+            await status.delete()
+            # Split on day separators to keep days together
+            chunks = []
+            current = ""
+            for line in plan_text.split("\n"):
+                if len(current) + len(line) + 1 > 3800 and current:
+                    chunks.append(current.strip())
+                    current = line + "\n"
+                else:
+                    current += line + "\n"
+            if current.strip():
+                chunks.append(current.strip())
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode="Markdown")
+    except Exception as e:
+        logger.error("Error sending plan: %s", e)
+        # Fallback: send without markdown
+        try:
+            await status.edit_text(plan_text[:4000])
+        except Exception:
+            await update.message.reply_text(plan_text[:4000])
 
 
 async def handle_log_workout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
