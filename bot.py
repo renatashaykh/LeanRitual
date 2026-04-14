@@ -139,20 +139,24 @@ def t(key: str, lang: str) -> str:
         "trial_warning":    {"en": "⚠️ *{days} free day(s) remaining* in your trial.",
                              "ru": "⚠️ *Осталось {days} бесплатных дней* пробного периода."},
         "paywall":          {"en": (
-                                "🔒 *Your 7-day free trial has ended.*\n\n"
-                                "To keep using NutriBot, send *$2 USD* via:\n"
-                                "• PayPal: `renatashaykh@gmail.com`\n"
-                                "• Or ask to be whitelisted\n\n"
-                                "📋 *Your Telegram ID:* `{user_id}`\n"
-                                "Send your ID + payment confirmation and you'll be unlocked within 24h."
+                                "⏳ *Your free trial has ended!*\n\n"
+                                "Thank you for trying LeanRitual 🙏\n\n"
+                                "To continue tracking your nutrition, unlock full access for just *$2 USD/month*:\n\n"
+                                "1️⃣ Send $2 USD to:\n"
+                                "`renatashaykheeva@gmail.com` *(PayPal)*\n\n"
+                                "2️⃣ Send your *Telegram ID* below to the same email or to the bot owner so we can unlock you:\n"
+                                "🪪 Your ID: `{user_id}`\n\n"
+                                "✅ You'll be unlocked within a few hours of payment confirmation."
                             ),
                              "ru": (
-                                "🔒 *Ваш 7-дневный пробный период завершён.*\n\n"
-                                "Чтобы продолжить использование NutriBot, отправьте *$2 USD*:\n"
-                                "• PayPal: `renatashaykh@gmail.com`\n"
-                                "• Или попросите добавить вас в белый список\n\n"
-                                "📋 *Ваш Telegram ID:* `{user_id}`\n"
-                                "Отправьте ваш ID и подтверждение оплаты — разблокировка в течение 24ч."
+                                "⏳ *Ваш пробный период завершён!*\n\n"
+                                "Спасибо, что попробовали LeanRitual 🙏\n\n"
+                                "Чтобы продолжить отслеживание питания, откройте полный доступ всего за *$2 в месяц*:\n\n"
+                                "1️⃣ Отправьте $2 USD на:\n"
+                                "`renatashaykheeva@gmail.com` *(PayPal)*\n\n"
+                                "2️⃣ Отправьте ваш *Telegram ID* ниже на ту же почту или владельцу бота:\n"
+                                "🪪 Ваш ID: `{user_id}`\n\n"
+                                "✅ Вы будете разблокированы в течение нескольких часов после подтверждения оплаты."
                             )},
     }
     return strings.get(key, {}).get(lang, strings.get(key, {}).get("en", key))
