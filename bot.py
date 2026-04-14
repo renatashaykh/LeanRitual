@@ -283,12 +283,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     profile = get_profile(update.effective_user.id)
-    if profile and profile.is_complete():
+    fitness_profile = get_fitness_profile(update.effective_user.id)
+
+    if profile and profile.is_complete() and fitness_profile and fitness_profile.is_complete():
         lang = lang_of(profile)
         await update.message.reply_text(
             t("welcome_back", lang), reply_markup=home_keyboard(lang),
         )
         return ConversationHandler.END
+
+    # If nutrition is done but fitness is missing, jump straight to fitness questions
+    if profile and profile.is_complete() and (not fitness_profile or not fitness_profile.is_complete()):
+        lang = lang_of(profile)
+        env_kb = ReplyKeyboardMarkup([
+            [KeyboardButton("🏋️ Gym" if lang == "en" else "🏋️ Тренажёрный зал")],
+            [KeyboardButton("🏠 Home (dumbbells & bodyweight)" if lang == "en" else "🏠 Дома (гантели и вес тела)")],
+            [KeyboardButton("🔄 Both" if lang == "en" else "🔄 И там и там")],
+        ], resize_keyboard=True, one_time_keyboard=True)
+        context.user_data["ob_lang"] = lang
+        await update.message.reply_text(
+            "🏋️ *Let's finish your fitness profile!*\n\n*Where do you train?*"
+            if lang == "en" else
+            "🏋️ *Давайте завершим фитнес-профиль!*\n\n*Где вы тренируетесь?*",
+            parse_mode="Markdown", reply_markup=env_kb,
+        )
+        return FIT_ENV
 
     await update.message.reply_text(
         t("choose_lang", "en"), reply_markup=lang_keyboard(),
