@@ -142,6 +142,10 @@ def record_and_check_trial(user_id: int) -> tuple[bool, TrialStatus]:
     return trial.is_trial_expired(), trial
 
 
+def current_month_str() -> str:
+    return datetime.now(USER_TIMEZONE).strftime("%Y-%m")
+
+
 # ── Daily meal log ────────────────────────────────────────────────────────────
 
 @dataclass
