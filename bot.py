@@ -1257,10 +1257,15 @@ def main() -> None:
     )
 
     # Daily job to check if monthly check-in reminders should be sent
-    app.job_queue.run_daily(
-        scheduled_checkin_reminder,
-        time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=USER_TIMEZONE),
-    )
+    try:
+        if app.job_queue:
+            app.job_queue.run_daily(
+                scheduled_checkin_reminder,
+                time=datetime.strptime("09:00", "%H:%M").time().replace(tzinfo=USER_TIMEZONE),
+            )
+            logger.info("Monthly check-in scheduler started.")
+    except Exception as e:
+        logger.warning("Job queue not available, monthly reminders disabled: %s", e)
 
     logger.info("LeanRitual starting…")
     app.run_polling(drop_pending_updates=True)
