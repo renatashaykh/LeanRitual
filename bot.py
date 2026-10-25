@@ -962,7 +962,7 @@ async def show_summary(update: Update, profile) -> None:
         if wl:
             workout_note = f"logged {wl.type}: {wl.workout_day or wl.activity_type} {wl.duration_min or ''} min".strip()
         prompt = build_summary_prompt(log, targets, profile, day_type=day_type, workout_note=workout_note)
-        coaching = await call_claude(prompt, max_tokens=700)
+        coaching = await call_claude(prompt, max_tokens=1500)
         body = header + "\n\n" + md_to_tg_html(coaching)
     except Exception as err:
         logger.exception("Summary failed: %s", err)
@@ -1071,6 +1071,9 @@ def api_error_reason(err: Exception) -> str:
         "BadRequestError": "request rejected",
     }
     reason = mapping.get(name, name)
+    if name == "BadRequestError":
+        detail = str(getattr(err, "message", "") or err)
+        reason += ": " + re.sub(r"\s+", " ", detail)[:120]
     if status == 529:
         reason = "Claude is overloaded"
     msg = str(getattr(err, "message", "") or err)
@@ -1079,7 +1082,7 @@ def api_error_reason(err: Exception) -> str:
     return reason
 
 
-async def call_claude(prompt: str, max_tokens: int = 1500) -> str:
+async def call_claude(prompt: str, max_tokens: int = 3000) -> str:
     """Text completion with automatic fallback to FALLBACK_MODEL. Non-blocking."""
     last_err = None
     for model in dict.fromkeys([ANTHROPIC_MODEL, FALLBACK_MODEL]):
@@ -1089,6 +1092,8 @@ async def call_claude(prompt: str, max_tokens: int = 1500) -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text")
+            if getattr(response, "stop_reason", "") == "max_tokens":
+                logger.warning("Reply hit max_tokens (%s) on %s — output truncated", max_tokens, model)
             if model != ANTHROPIC_MODEL:
                 logger.warning("Used fallback model %s", model)
             return text
@@ -1145,7 +1150,7 @@ async def handle_weekly_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
     try:
-        plan_text = await call_claude(prompt, max_tokens=2000)
+        plan_text = await call_claude(prompt, max_tokens=8000)
     except Exception as e:
         logger.error("Claude error generating plan: %s", e)
         await status.edit_text(
@@ -1331,7 +1336,7 @@ async def handle_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     prompt = build_progress_prompt(fitness_profile, profile, recent_weeks, recent_logs, lang)
     try:
-        response = await call_claude(prompt, max_tokens=800)
+        response = await call_claude(prompt, max_tokens=2000)
         await send_ai_text(status, response, edit=True)
     except Exception as e:
         logger.error("Progress error: %s", e)
@@ -1405,7 +1410,7 @@ async def checkin_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     )
 
     try:
-        response = await call_claude(prompt, max_tokens=1200)
+        response = await call_claude(prompt, max_tokens=3000)
     except Exception as e:
         logger.error("Check-in error: %s", e)
         await status.edit_text("⚠️ Error generating review. Please try again.")

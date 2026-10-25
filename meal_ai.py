@@ -154,29 +154,68 @@ def finalise_estimate(raw: dict) -> dict:
 
 FALLBACK_MODEL = __import__("os").getenv("FALLBACK_MODEL", "claude-sonnet-5-5")
 
+JSON_FALLBACK_NOTE = (
+    "\n\nIf you cannot call the record_meal tool, reply with ONLY the tool's JSON input "
+    "inside <meal_json></meal_json> tags."
+)
+
+
+def _parse_response(resp) -> dict | None:
+    """Accept a record_meal tool call, or JSON in <meal_json> tags / a bare JSON object."""
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use" and getattr(block, "name", "") == "record_meal":
+            return block.input
+    text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", None) == "text")
+    m = re.search(r"<meal_json>(.*?)</meal_json>", text, re.DOTALL) or re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            import json
+            return json.loads(m.group(1) if m.lastindex else m.group(0))
+        except ValueError:
+            return None
+    return None
+
 
 async def _call_tool(client, model: str, content: list) -> dict:
+    """
+    Ask for the structured record_meal call. Some models run with thinking enabled,
+    and the API rejects a *forced* tool choice in that case — so on a 400 we retry the
+    same model with tool_choice=auto (the system prompt still requires the tool), and
+    accept a JSON reply as a last resort. Then fall back to FALLBACK_MODEL.
+    """
     last_err = None
-    for m in dict.fromkeys([model, FALLBACK_MODEL]):
+    attempts = [
+        (m, choice)
+        for m in dict.fromkeys([model, FALLBACK_MODEL])
+        for choice in ({"type": "tool", "name": "record_meal"}, {"type": "auto"})
+    ]
+    skip_model = None
+    for m, choice in attempts:
+        if m == skip_model:
+            continue
         try:
             resp = await client.messages.create(
                 model=m,
-                max_tokens=2000,
-                system=SYSTEM_PROMPT,
+                max_tokens=4000,
+                system=SYSTEM_PROMPT + (JSON_FALLBACK_NOTE if choice["type"] == "auto" else ""),
                 tools=[MEAL_TOOL],
-                tool_choice={"type": "tool", "name": "record_meal"},
+                tool_choice=choice,
                 messages=[{"role": "user", "content": content}],
             )
-            break
         except Exception as err:
             last_err = err
-            logger.error("Meal call failed on %s: %s", m, err)
-    else:
-        raise last_err
-    for block in resp.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "record_meal":
-            return block.input
-    raise RuntimeError("Model did not return a record_meal tool call")
+            logger.error("Meal call failed on %s (tool_choice=%s): %s", m, choice["type"], err)
+            if type(err).__name__ != "BadRequestError":
+                skip_model = m  # not a tool-choice problem → go straight to the next model
+            continue
+        parsed = _parse_response(resp)
+        if parsed is not None:
+            if (m, choice["type"]) != (model, "tool"):
+                logger.warning("Meal estimate came from %s with tool_choice=%s", m, choice["type"])
+            return parsed
+        last_err = RuntimeError("Model returned no record_meal data")
+        logger.error("No record_meal data from %s (tool_choice=%s)", m, choice["type"])
+    raise last_err
 
 
 def _image_block(image_b64: str, media_type: str) -> dict:
