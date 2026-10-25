@@ -152,15 +152,27 @@ def finalise_estimate(raw: dict) -> dict:
     }
 
 
+FALLBACK_MODEL = __import__("os").getenv("FALLBACK_MODEL", "claude-sonnet-5-5")
+
+
 async def _call_tool(client, model: str, content: list) -> dict:
-    resp = await client.messages.create(
-        model=model,
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        tools=[MEAL_TOOL],
-        tool_choice={"type": "tool", "name": "record_meal"},
-        messages=[{"role": "user", "content": content}],
-    )
+    last_err = None
+    for m in dict.fromkeys([model, FALLBACK_MODEL]):
+        try:
+            resp = await client.messages.create(
+                model=m,
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                tools=[MEAL_TOOL],
+                tool_choice={"type": "tool", "name": "record_meal"},
+                messages=[{"role": "user", "content": content}],
+            )
+            break
+        except Exception as err:
+            last_err = err
+            logger.error("Meal call failed on %s: %s", m, err)
+    else:
+        raise last_err
     for block in resp.content:
         if getattr(block, "type", None) == "tool_use" and block.name == "record_meal":
             return block.input
