@@ -9,8 +9,9 @@ File layout:
 
 import json
 import os
-from dataclasses import dataclass, asdict, field
-from datetime import date, datetime
+import uuid
+from dataclasses import dataclass, asdict, field, fields
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -21,9 +22,13 @@ TRIAL_DAYS = 7          # free active-use days before paywall
 PAID_WHITELIST_RAW = os.getenv("PAID_WHITELIST", "")  # comma-separated user IDs, always free
 
 
+def now_local() -> datetime:
+    return datetime.now(USER_TIMEZONE)
+
+
 def today_str() -> str:
     """Return today's date string in the user's local timezone."""
-    return datetime.now(USER_TIMEZONE).date().isoformat()
+    return now_local().date().isoformat()
 
 
 def is_whitelisted(user_id: int) -> bool:
@@ -31,6 +36,18 @@ def is_whitelisted(user_id: int) -> bool:
         return False
     ids = {int(x.strip()) for x in PAID_WHITELIST_RAW.split(",") if x.strip()}
     return user_id in ids
+
+
+def _from_dict(cls, data: dict):
+    """Build a dataclass from JSON, ignoring unknown keys (forward/backward compatible)."""
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def _user_dir(user_id: int) -> Path:
+    path = DATA_DIR / str(user_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 # ── User profile ──────────────────────────────────────────────────────────────
@@ -42,34 +59,29 @@ class UserProfile:
     weight_kg: float = 0.0
     goal: str = ""
     language: str = "en"
+    height_cm: float = 0.0
+    # Optional manual overrides, e.g. {"training": {"kcal": 1750, "protein": 120}, "rest": {...}}
+    custom_targets: dict = field(default_factory=dict)
 
     def is_complete(self) -> bool:
         return all([self.age, self.sex, self.weight_kg, self.goal])
 
 
-def _profile_path(user_id: int) -> Path:
-    path = DATA_DIR / str(user_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path / "profile.json"
-
-
 def get_profile(user_id: int) -> UserProfile | None:
-    path = _profile_path(user_id)
+    path = _user_dir(user_id) / "profile.json"
     if path.exists():
         with open(path) as f:
-            data = json.load(f)
-        return UserProfile(**data)
+            return _from_dict(UserProfile, json.load(f))
     return None
 
 
 def save_profile(user_id: int, profile: UserProfile) -> None:
-    path = _profile_path(user_id)
-    with open(path, "w") as f:
-        json.dump(asdict(profile), f, indent=2)
+    with open(_user_dir(user_id) / "profile.json", "w") as f:
+        json.dump(asdict(profile), f, indent=2, ensure_ascii=False)
 
 
 def delete_profile(user_id: int) -> None:
-    path = _profile_path(user_id)
+    path = _user_dir(user_id) / "profile.json"
     if path.exists():
         path.unlink()
 
@@ -99,24 +111,16 @@ class TrialStatus:
         return max(0, TRIAL_DAYS - self.active_day_count())
 
 
-def _trial_path(user_id: int) -> Path:
-    path = DATA_DIR / str(user_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path / "trial.json"
-
-
 def get_trial(user_id: int) -> TrialStatus:
-    path = _trial_path(user_id)
+    path = _user_dir(user_id) / "trial.json"
     if path.exists():
         with open(path) as f:
-            data = json.load(f)
-        return TrialStatus(**data)
+            return _from_dict(TrialStatus, json.load(f))
     return TrialStatus()
 
 
 def save_trial(user_id: int, trial: TrialStatus) -> None:
-    path = _trial_path(user_id)
-    with open(path, "w") as f:
+    with open(_user_dir(user_id) / "trial.json", "w") as f:
         json.dump(asdict(trial), f, indent=2)
 
 
@@ -138,40 +142,83 @@ def record_and_check_trial(user_id: int) -> tuple[bool, TrialStatus]:
     trial = get_trial(user_id)
     trial.record_activity()
     save_trial(user_id, trial)
-
     return trial.is_trial_expired(), trial
 
 
 def current_month_str() -> str:
-    return datetime.now(USER_TIMEZONE).strftime("%Y-%m")
+    return now_local().strftime("%Y-%m")
 
 
 # ── Daily meal log ────────────────────────────────────────────────────────────
+# Each meal entry:
+#   {id, time, name, items:[{name, amount, grams, kcal, protein_g, carbs_g, fat_g, fibre_g}],
+#    kcal, protein, carbs, fat, fibre, description, photo_file_id, confidence,
+#    assumptions, bot_message_id}
+# Totals on the log are ALWAYS recomputed from meals, so edits/removals never drift.
 
 @dataclass
 class DailyLog:
     date: str = ""
+    day_type: str = ""          # "training" / "rest" / "" (not chosen yet)
     meal_count: int = 0
     total_kcal: float = 0.0
     total_protein: float = 0.0
     total_carbs: float = 0.0
     total_fat: float = 0.0
+    total_fibre: float = 0.0
     meals: list = field(default_factory=list)
 
-    def add_meal(self, kcal, protein, carbs, fat, label="") -> None:
-        self.meal_count += 1
-        self.total_kcal += kcal
-        self.total_protein += protein
-        self.total_carbs += carbs
-        self.total_fat += fat
-        self.meals.append({
-            "meal_num": self.meal_count,
-            "label": label,
-            "kcal": kcal,
-            "protein": protein,
-            "carbs": carbs,
-            "fat": fat,
+    def recalc(self) -> None:
+        for i, m in enumerate(self.meals, start=1):
+            m.setdefault("id", uuid.uuid4().hex[:8])
+            m["meal_num"] = i
+        self.meal_count = len(self.meals)
+        self.total_kcal = round(sum(float(m.get("kcal", 0) or 0) for m in self.meals), 1)
+        self.total_protein = round(sum(float(m.get("protein", 0) or 0) for m in self.meals), 1)
+        self.total_carbs = round(sum(float(m.get("carbs", 0) or 0) for m in self.meals), 1)
+        self.total_fat = round(sum(float(m.get("fat", 0) or 0) for m in self.meals), 1)
+        self.total_fibre = round(sum(float(m.get("fibre", 0) or 0) for m in self.meals), 1)
+
+    def add_meal_entry(self, entry: dict) -> dict:
+        entry = dict(entry)
+        entry.setdefault("id", uuid.uuid4().hex[:8])
+        entry.setdefault("time", now_local().strftime("%H:%M"))
+        self.meals.append(entry)
+        self.recalc()
+        return entry
+
+    def add_meal(self, kcal, protein, carbs, fat, label="") -> dict:
+        """Backwards-compatible simple add."""
+        return self.add_meal_entry({
+            "name": label, "kcal": kcal, "protein": protein, "carbs": carbs, "fat": fat,
         })
+
+    def find_meal(self, meal_id: str) -> dict | None:
+        return next((m for m in self.meals if m.get("id") == meal_id), None)
+
+    def find_by_message(self, message_id: int) -> dict | None:
+        return next((m for m in self.meals if m.get("bot_message_id") == message_id), None)
+
+    def replace_meal(self, meal_id: str, new_entry: dict) -> dict | None:
+        for i, m in enumerate(self.meals):
+            if m.get("id") == meal_id:
+                merged = dict(new_entry)
+                merged["id"] = meal_id
+                merged.setdefault("time", m.get("time"))
+                merged.setdefault("bot_message_id", m.get("bot_message_id"))
+                merged.setdefault("photo_file_id", m.get("photo_file_id"))
+                self.meals[i] = merged
+                self.recalc()
+                return merged
+        return None
+
+    def remove_meal(self, meal_id: str) -> dict | None:
+        for i, m in enumerate(self.meals):
+            if m.get("id") == meal_id:
+                removed = self.meals.pop(i)
+                self.recalc()
+                return removed
+        return None
 
     def remaining(self, targets: dict) -> dict:
         return {
@@ -182,34 +229,40 @@ class DailyLog:
         }
 
 
-def _log_path(user_id: int) -> Path:
-    """Use timezone-aware today so midnight resets correctly for Toronto users."""
-    path = DATA_DIR / str(user_id)
-    path.mkdir(parents=True, exist_ok=True)
-    return path / f"{today_str()}.json"
+def _log_path(user_id: int, date_str: str) -> Path:
+    return _user_dir(user_id) / f"{date_str}.json"
+
+
+def get_log(user_id: int, date_str: str) -> DailyLog:
+    path = _log_path(user_id, date_str)
+    if path.exists():
+        with open(path) as f:
+            log = _from_dict(DailyLog, json.load(f))
+        log.date = date_str
+        # Older logs: normalise entries ("label" → "name") and recompute totals
+        for m in log.meals:
+            if "name" not in m and m.get("label"):
+                m["name"] = m["label"]
+        log.recalc()
+        return log
+    return DailyLog(date=date_str)
 
 
 def get_today_log(user_id: int) -> DailyLog:
-    path = _log_path(user_id)
-    if path.exists():
-        with open(path) as f:
-            data = json.load(f)
-        log = DailyLog(**data)
-        # Safety check: if stored date doesn't match today, return fresh log
-        if log.date != today_str():
-            return DailyLog(date=today_str())
-        return log
-    return DailyLog(date=today_str())
+    """Timezone-aware: flips at local midnight."""
+    return get_log(user_id, today_str())
 
 
 def save_log(user_id: int, log: DailyLog) -> None:
-    path = _log_path(user_id)
-    with open(path, "w") as f:
-        json.dump(asdict(log), f, indent=2)
+    if not log.date:
+        log.date = today_str()
+    log.recalc()
+    with open(_log_path(user_id, log.date), "w") as f:
+        json.dump(asdict(log), f, indent=2, ensure_ascii=False)
 
 
 def reset_log(user_id: int) -> None:
-    path = _log_path(user_id)
+    path = _log_path(user_id, today_str())
     if path.exists():
         path.unlink()
 
@@ -219,10 +272,17 @@ def undo_last_meal(user_id: int) -> dict | None:
     if not log.meals:
         return None
     removed = log.meals.pop()
-    log.meal_count -= 1
-    log.total_kcal -= removed["kcal"]
-    log.total_protein -= removed["protein"]
-    log.total_carbs -= removed["carbs"]
-    log.total_fat -= removed["fat"]
     save_log(user_id, log)
     return removed
+
+
+def find_meal_by_message(user_id: int, message_id: int, days_back: int = 2) -> tuple[DailyLog, dict] | None:
+    """Find which logged meal a bot message belongs to (for reply-to-correct)."""
+    from datetime import timedelta
+    base = now_local().date()
+    for d in range(days_back + 1):
+        log = get_log(user_id, (base - timedelta(days=d)).isoformat())
+        meal = log.find_by_message(message_id)
+        if meal:
+            return log, meal
+    return None

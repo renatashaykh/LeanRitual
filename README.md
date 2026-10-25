@@ -4,6 +4,19 @@ A personal Telegram bot that uses **Claude Vision** to analyse meal photos and t
 
 ---
 
+## 🆕 v1.1 — accurate meal logging
+
+- **Itemised estimates** — every component (incl. cooking oil, butter, sauces) gets its own row with grams; totals are summed in code, not by the model
+- **✏️ Fix / 🗑 Remove** buttons on every logged meal; replying to a meal message also corrects it (replaces the entry, no double counting)
+- **📋 Today's Meals** — list with per-meal fix/remove
+- **🎯 Targets** — set your own calories/protein (and optionally fat) per training/rest day, or use auto-calculated
+- **Height** is now part of your profile (used in the BMR formula)
+- Training/rest day choice is saved per day and auto-switches to training when you log a workout
+- All AI replies are rendered as Telegram-safe HTML (no more silent send failures)
+- Model configurable via `ANTHROPIC_MODEL` (default `claude-opus-5-5`)
+
+---
+
 ## ✨ Features
 
 - 📸 **Photo analysis** — send a meal photo and get instant macro estimates

@@ -52,8 +52,8 @@ def _calculate_targets(profile: UserProfile, day_type: str) -> dict:
     sex = profile.sex.lower()
     goal = profile.goal
 
-    # Assume average height if not provided (165cm female, 175cm male)
-    h = 165 if sex == "female" else 175
+    # Use real height when known, otherwise an average (165cm female, 175cm male)
+    h = profile.height_cm or (165 if sex == "female" else 175)
 
     # BMR
     if sex == "female":
@@ -103,10 +103,33 @@ def _calculate_targets(profile: UserProfile, day_type: str) -> dict:
     }
 
 
+def _apply_custom(base: dict, custom: dict, weight_kg: float) -> dict:
+    """
+    Apply a user's manual targets on top of the calculated ones.
+    custom = {"kcal": 1750, "protein": 120, "fat": 55 (optional)}
+    Carbs fill whatever calories are left.
+    """
+    kcal = int(custom.get("kcal") or (base["kcal_min"] + base["kcal_max"]) // 2)
+    protein = int(custom.get("protein") or (base["protein_min"] + base["protein_max"]) // 2)
+    fat = int(custom.get("fat") or round(weight_kg * 0.9) or (base["fat_min"] + base["fat_max"]) // 2)
+    carbs = max(round((kcal - protein * 4 - fat * 9) / 4), 50)
+    return {
+        "kcal_min": kcal - 25, "kcal_max": kcal + 25,
+        "protein_min": protein - 5, "protein_max": protein + 5,
+        "carbs_min": carbs - 15, "carbs_max": carbs + 15,
+        "fat_min": fat - 5, "fat_max": fat + 5,
+        "custom": True,
+    }
+
+
 def get_targets(day_type: str, profile: UserProfile | None = None) -> dict:
     """Return macro targets for the given day type and user profile."""
-    if profile and profile.is_complete():
-        return _calculate_targets(profile, day_type)
-    # Fallback defaults (moderate female, fat loss)
-    fallback_profile = UserProfile(age=30, sex="female", weight_kg=65, goal=GOAL_FAT_LOSS)
-    return _calculate_targets(fallback_profile, day_type)
+    if not (profile and profile.is_complete()):
+        # Fallback defaults (moderate female, fat loss)
+        profile = UserProfile(age=30, sex="female", weight_kg=65, goal=GOAL_FAT_LOSS)
+    base = _calculate_targets(profile, day_type)
+    custom = (profile.custom_targets or {}).get(day_type)
+    if custom:
+        return _apply_custom(base, custom, profile.weight_kg)
+    base["custom"] = False
+    return base

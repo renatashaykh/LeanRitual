@@ -9,36 +9,42 @@ import base64
 import json
 import re
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+)
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     filters,
     ContextTypes,
-    JobQueue,
 )
 
 from storage import (
-    DailyLog, UserProfile,
-    get_today_log, save_log, reset_log, undo_last_meal,
-    get_profile, save_profile, delete_profile,
-    get_trial, record_and_check_trial, mark_paid,
-    current_month_str,
+    UserProfile,
+    get_today_log, get_log, save_log, reset_log, undo_last_meal, find_meal_by_message,
+    get_profile, save_profile,
+    record_and_check_trial, mark_paid,
 )
+import meal_ai
+from meal_ai import md_to_tg_html, strip_tags, split_message, render_meal
 from targets import (
     get_targets, DAY_TYPE_TRAINING, DAY_TYPE_REST,
     GOAL_FAT_LOSS, GOAL_MUSCLE_GAIN, GOAL_MAINTAIN, GOAL_LABELS,
 )
-from prompts import build_analysis_prompt, build_summary_prompt
+from prompts import build_summary_prompt
 from fitness_storage import (
     FitnessProfile,
-    get_fitness_profile, save_fitness_profile, delete_fitness_profile,
-    get_weekly_plan, save_weekly_plan, get_recent_weeks,
+    get_fitness_profile, save_fitness_profile,
+    WeeklyPlan, get_weekly_plan, save_weekly_plan, get_recent_weeks,
     WorkoutLog, save_workout_log, get_recent_workout_logs,
     get_checkin_status, save_checkin_status, record_checkin,
     is_checkin_due, current_week_key, today_str,
@@ -59,7 +65,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ANTHROPIC_MODEL = "claude-opus-4-5"
+# Override in Railway with the ANTHROPIC_MODEL variable if needed.
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5")
 USER_TIMEZONE = ZoneInfo(os.getenv("USER_TIMEZONE", "America/Toronto"))
 
 ALLOWED_USERS_RAW = os.getenv("ALLOWED_USER_IDS", "")
@@ -69,6 +76,7 @@ ALLOWED_USERS: set[int] = (
 )
 
 anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+async_client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 # ── Conversation states ───────────────────────────────────────────────────────
 # Nutrition onboarding
@@ -83,6 +91,8 @@ CHECKIN_WEIGHT, CHECKIN_NOTES = range(14, 16)
 LOG_WORKOUT_TEXT = 16
 # Activity logging
 LOG_ACTIVITY_TEXT = 17
+# Height (onboarding + profile edit)
+ASK_HEIGHT, EDIT_HEIGHT = 18, 19
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -153,6 +163,12 @@ def t(key: str, lang: str) -> str:
         "edit_weight":      {"en": "✏️ Weight", "ru": "✏️ Вес"},
         "edit_goal":        {"en": "✏️ Goal",   "ru": "✏️ Цель"},
         "edit_cancel":      {"en": "✖️ Cancel", "ru": "✖️ Отмена"},
+        "edit_height":      {"en": "✏️ Height", "ru": "✏️ Рост"},
+        "height_label":     {"en": "Height", "ru": "Рост"},
+        "ask_height":       {"en": "✅ Got it!\n\n*How tall are you in cm?*\n_(e.g. 160 — makes your calorie targets more accurate)_",
+                             "ru": "✅ Отлично!\n\n*Ваш рост в см?*\n_(например, 160 — так цели по калориям будут точнее)_"},
+        "bad_height":       {"en": "Please enter your height in cm (e.g. 160).",
+                             "ru": "Введите рост в см (например, 160)."},
         "updated":          {"en": "✅ Updated!", "ru": "✅ Обновлено!"},
         "profile_deleted":  {"en": "Profile deleted. Send /start to set up a new one.",
                              "ru": "Профиль удалён. Отправьте /start для настройки нового."},
@@ -215,15 +231,15 @@ def main_keyboard(lang: str = "en") -> ReplyKeyboardMarkup:
     """Nutrition section keyboard."""
     if lang == "ru":
         return ReplyKeyboardMarkup([
-            [KeyboardButton("📊 Сводка за день"), KeyboardButton("🏋️ День тренировки")],
-            [KeyboardButton("😴 День отдыха"),    KeyboardButton("🔄 Сбросить день")],
-            [KeyboardButton("↩️ Отменить запись")],
+            [KeyboardButton("📊 Сводка за день"), KeyboardButton("📋 Приёмы пищи")],
+            [KeyboardButton("🏋️ День тренировки"), KeyboardButton("😴 День отдыха")],
+            [KeyboardButton("🎯 Цели"),            KeyboardButton("↩️ Отменить запись")],
             [KeyboardButton("🔙 Главное меню")],
         ], resize_keyboard=True)
     return ReplyKeyboardMarkup([
-        [KeyboardButton("📊 Daily Summary"), KeyboardButton("🏋️ Training Day")],
-        [KeyboardButton("😴 Rest Day"),      KeyboardButton("🔄 Reset Today")],
-        [KeyboardButton("↩️ Undo Last Entry")],
+        [KeyboardButton("📊 Daily Summary"), KeyboardButton("📋 Today's Meals")],
+        [KeyboardButton("🏋️ Training Day"),  KeyboardButton("😴 Rest Day")],
+        [KeyboardButton("🎯 Targets"),       KeyboardButton("↩️ Undo Last Entry")],
         [KeyboardButton("🔙 Main Menu")],
     ], resize_keyboard=True)
 
@@ -273,7 +289,7 @@ def edit_keyboard(lang: str = "en") -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([
         [KeyboardButton(t("edit_sex", lang)),  KeyboardButton(t("edit_age", lang))],
         [KeyboardButton(t("edit_weight", lang)), KeyboardButton(t("edit_goal", lang))],
-        [KeyboardButton(t("edit_cancel", lang))],
+        [KeyboardButton(t("edit_height", lang)), KeyboardButton(t("edit_cancel", lang))],
     ], resize_keyboard=True, one_time_keyboard=True)
 
 
@@ -365,6 +381,25 @@ async def onboard_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ASK_WEIGHT
 
     context.user_data["ob_weight"] = weight
+    await update.message.reply_text(t("ask_height", lang), parse_mode="Markdown")
+    return ASK_HEIGHT
+
+
+def _parse_height(text: str) -> float | None:
+    try:
+        h = float(text.strip().lower().replace("cm", "").replace("см", "").replace(",", ".").strip())
+        return h if 120 <= h <= 230 else None
+    except ValueError:
+        return None
+
+
+async def onboard_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("ob_lang", "en")
+    height = _parse_height(update.message.text)
+    if height is None:
+        await update.message.reply_text(t("bad_height", lang))
+        return ASK_HEIGHT
+    context.user_data["ob_height"] = height
     await update.message.reply_text(
         t("ask_goal", lang), parse_mode="Markdown",
         reply_markup=goal_keyboard(lang),
@@ -386,6 +421,7 @@ async def onboard_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         age=context.user_data["ob_age"],
         sex=context.user_data["ob_sex"],
         weight_kg=context.user_data["ob_weight"],
+        height_cm=context.user_data.get("ob_height", 0.0),
         goal=goal,
         language=lang,
     )
@@ -533,6 +569,7 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"{t('sex_label', lang)}: {sex_display}\n"
         f"{t('age_label', lang)}: {profile.age}\n"
         f"{t('weight_label', lang)}: {profile.weight_kg} kg\n"
+        f"{t('height_label', lang)}: {str(int(profile.height_cm)) + ' cm' if profile.height_cm else '—'}\n"
         f"{t('goal_label', lang)}: {goal_label}\n\n"
         f"{t('training_label', lang)}: {targets_t['kcal_min']}–{targets_t['kcal_max']} kcal | {targets_t['protein_max']}g {t('protein', lang).lower()}\n"
         f"{t('rest_label', lang)}: {targets_r['kcal_min']}–{targets_r['kcal_max']} kcal | {targets_r['protein_max']}g {t('protein', lang).lower()}\n\n"
@@ -563,6 +600,9 @@ async def edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     elif any(w in text.lower() for w in ["age", "возраст"]):
         await update.message.reply_text(t("ask_age", lang), parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return EDIT_AGE
+    elif any(w in text.lower() for w in ["height", "рост"]):
+        await update.message.reply_text(t("ask_height", lang), parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+        return EDIT_HEIGHT
     elif any(w in text.lower() for w in ["weight", "вес"]):
         await update.message.reply_text(t("ask_weight", lang), parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
         return EDIT_WEIGHT
@@ -615,6 +655,19 @@ async def edit_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return EDIT_WEIGHT
 
 
+async def edit_height(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    profile = get_profile(update.effective_user.id)
+    lang = lang_of(profile)
+    height = _parse_height(update.message.text)
+    if height is None:
+        await update.message.reply_text(t("bad_height", lang))
+        return EDIT_HEIGHT
+    profile.height_cm = height
+    save_profile(update.effective_user.id, profile)
+    await update.message.reply_text(t("updated", lang), reply_markup=main_keyboard(lang))
+    return ConversationHandler.END
+
+
 async def edit_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     profile = get_profile(update.effective_user.id)
     lang = lang_of(profile)
@@ -630,47 +683,374 @@ async def edit_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── Claude API calls ──────────────────────────────────────────────────────────
-def analyse_meal(image_b64, text_description, day_log, day_type, profile):
-    targets = get_targets(day_type, profile)
-    prompt = build_analysis_prompt(
-        text_description=text_description,
-        current_log=day_log,
-        targets=targets,
-        profile=profile,
-    )
-    content: list = []
-    if image_b64:
-        content.append({
-            "type": "image",
-            "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
-        })
-    content.append({"type": "text", "text": prompt})
-    response = anthropic_client.messages.create(
-        model=ANTHROPIC_MODEL, max_tokens=1024,
-        messages=[{"role": "user", "content": content}],
-    )
-    return response.content[0].text
+# ── Safe sending (Telegram HTML, never fails on formatting) ──────────────────
+async def send_html(message, text_html: str, reply_markup=None, edit: bool = False):
+    """
+    Send (or edit into) a message as Telegram HTML. Splits long text, and falls
+    back to plain text if Telegram rejects the markup. Returns the last Message.
+    """
+    chunks = split_message(text_html)
+    sent = None
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        markup = reply_markup if is_last else None
+        try:
+            if edit and i == 0:
+                sent = await message.edit_text(chunk, parse_mode="HTML", reply_markup=markup)
+            else:
+                sent = await message.reply_text(chunk, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as err:
+            logger.warning("HTML send failed (%s) — falling back to plain text", err)
+            plain = strip_tags(chunk)
+            if edit and i == 0:
+                sent = await message.edit_text(plain, reply_markup=markup)
+            else:
+                sent = await message.reply_text(plain, reply_markup=markup)
+    return sent
 
 
-def get_daily_summary(day_log, day_type, profile):
-    targets = get_targets(day_type, profile)
-    prompt = build_summary_prompt(day_log, targets, profile)
-    response = anthropic_client.messages.create(
-        model=ANTHROPIC_MODEL, max_tokens=600,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text
+async def send_ai_text(message, raw_markdown: str, reply_markup=None, edit: bool = False):
+    """Render free-text Claude output (Markdown) safely."""
+    return await send_html(message, md_to_tg_html(raw_markdown), reply_markup=reply_markup, edit=edit)
 
 
-def extract_macros_from_response(response_text: str) -> dict | None:
-    match = re.search(r"<macros>(.*?)</macros>", response_text, re.DOTALL)
-    if not match:
-        return None
+# ── Day type (persisted per day, no longer lost on redeploy) ─────────────────
+def current_day_type(user_id: int, log=None) -> str:
+    log = log or get_today_log(user_id)
+    if log.day_type:
+        return log.day_type
+    # Auto: a workout logged today makes it a training day
     try:
-        return json.loads(match.group(1).strip())
-    except json.JSONDecodeError:
-        return None
+        from fitness_storage import get_workout_log
+        wl = get_workout_log(user_id)
+        if wl and wl.type == "workout":
+            return DAY_TYPE_TRAINING
+    except Exception:
+        pass
+    return DAY_TYPE_TRAINING
+
+
+def set_day_type(user_id: int, day_type: str) -> None:
+    log = get_today_log(user_id)
+    log.day_type = day_type
+    save_log(user_id, log)
+
+
+# ── Meal logging ──────────────────────────────────────────────────────────────
+def meal_buttons(date_str: str, meal_id: str, lang: str) -> InlineKeyboardMarkup:
+    fix = "✏️ Fix" if lang == "en" else "✏️ Исправить"
+    rm = "🗑 Remove" if lang == "en" else "🗑 Удалить"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(fix, callback_data=f"meal|fix|{date_str}|{meal_id}"),
+        InlineKeyboardButton(rm, callback_data=f"meal|del|{date_str}|{meal_id}"),
+    ]])
+
+
+async def download_image(context, file_id: str) -> str:
+    file = await context.bot.get_file(file_id)
+    data = await file.download_as_bytearray()
+    return base64.b64encode(bytes(data)).decode("utf-8")
+
+
+def _goal_label(profile) -> str:
+    return GOAL_LABELS.get(profile.goal, profile.goal) if profile else ""
+
+
+async def log_meal(update: Update, context: ContextTypes.DEFAULT_TYPE, profile, *,
+                   image_file_id: str | None, media_type: str, description: str) -> None:
+    user_id = update.effective_user.id
+    lang = lang_of(profile)
+    log = get_today_log(user_id)
+    day_type = current_day_type(user_id, log)
+    targets = get_targets(day_type, profile)
+    status_msg = await update.message.reply_text(t("analysing", lang))
+
+    try:
+        image_b64 = await download_image(context, image_file_id) if image_file_id else None
+        est = await meal_ai.estimate_meal(
+            async_client, ANTHROPIC_MODEL,
+            image_b64=image_b64, media_type=media_type, description=description,
+            profile=profile, goal_label=_goal_label(profile),
+            protein_left=targets["protein_max"] - log.total_protein, lang=lang,
+        )
+    except Exception as err:
+        logger.exception("Meal estimation failed: %s", err)
+        await status_msg.edit_text(t("analyse_error", lang))
+        return
+
+    if not est["is_food"]:
+        q = est["clarification_question"] or (
+            "I couldn't identify a meal here — could you describe what you ate?" if lang == "en"
+            else "Не получилось распознать блюдо — опишите, пожалуйста, что вы съели?")
+        await status_msg.edit_text(f"🤔 {q}")
+        return
+
+    entry = {
+        "name": est["name"], "items": est["items"],
+        "kcal": est["kcal"], "protein": est["protein"], "carbs": est["carbs"],
+        "fat": est["fat"], "fibre": est["fibre"],
+        "assumptions": est["assumptions"], "confidence": est["confidence"], "tip": est["tip"],
+        "description": description, "photo_file_id": image_file_id, "media_type": media_type,
+    }
+    entry = log.add_meal_entry(entry)
+    entry["bot_message_id"] = status_msg.message_id
+    save_log(user_id, log)
+
+    text = render_meal(entry, log, targets, day_type, lang,
+                       show_fix_hint=bool(image_file_id and not description))
+    await send_html(status_msg, text, reply_markup=meal_buttons(log.date, entry["id"], lang), edit=True)
+
+
+async def apply_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, profile,
+                           date_str: str, meal_id: str, correction: str) -> None:
+    user_id = update.effective_user.id
+    lang = lang_of(profile)
+    log = get_log(user_id, date_str)
+    meal = log.find_meal(meal_id)
+    if not meal:
+        await update.message.reply_text(
+            "I couldn't find that meal any more." if lang == "en" else "Не нашёл эту запись.")
+        return
+    status_msg = await update.message.reply_text(
+        "✏️ Updating that meal…" if lang == "en" else "✏️ Обновляю запись…")
+    try:
+        image_b64 = None
+        if meal.get("photo_file_id"):
+            try:
+                image_b64 = await download_image(context, meal["photo_file_id"])
+            except Exception:
+                logger.warning("Could not re-download photo for correction")
+        est = await meal_ai.correct_meal(
+            async_client, ANTHROPIC_MODEL, previous=meal, correction=correction,
+            image_b64=image_b64, media_type=meal.get("media_type", "image/jpeg"),
+            profile=profile, goal_label=_goal_label(profile), lang=lang,
+        )
+    except Exception as err:
+        logger.exception("Correction failed: %s", err)
+        await status_msg.edit_text(t("analyse_error", lang))
+        return
+
+    description = " · ".join(x for x in [meal.get("description", ""), correction] if x)
+    new_entry = {
+        "name": est["name"], "items": est["items"],
+        "kcal": est["kcal"], "protein": est["protein"], "carbs": est["carbs"],
+        "fat": est["fat"], "fibre": est["fibre"],
+        "assumptions": est["assumptions"], "confidence": est["confidence"], "tip": est["tip"],
+        "description": description,
+    }
+    updated = log.replace_meal(meal_id, new_entry)
+    updated["bot_message_id"] = status_msg.message_id
+    save_log(user_id, log)
+
+    day_type = current_day_type(user_id, log) if log.date == get_today_log(user_id).date else (log.day_type or DAY_TYPE_TRAINING)
+    targets = get_targets(day_type, profile)
+    text = render_meal(updated, log, targets, day_type, lang, updated=True)
+    await send_html(status_msg, text, reply_markup=meal_buttons(log.date, meal_id, lang), edit=True)
+
+
+async def on_meal_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    profile = get_profile(user_id)
+    lang = lang_of(profile)
+    try:
+        _, action, date_str, meal_id = query.data.split("|", 3)
+    except ValueError:
+        await query.answer()
+        return
+    log = get_log(user_id, date_str)
+    meal = log.find_meal(meal_id)
+    if not meal:
+        await query.answer("Already removed" if lang == "en" else "Уже удалено", show_alert=False)
+        return
+
+    if action == "del":
+        log.remove_meal(meal_id)
+        save_log(user_id, log)
+        await query.answer("Removed" if lang == "en" else "Удалено")
+        note = (f"🗑 <s>{meal_ai.e(meal.get('name', 'Meal'))} — {meal.get('kcal', 0):.0f} kcal</s>\n"
+                f"Removed. Today: {log.total_kcal:.0f} kcal · protein {log.total_protein:.0f} g"
+                if lang == "en" else
+                f"🗑 <s>{meal_ai.e(meal.get('name', 'Блюдо'))} — {meal.get('kcal', 0):.0f} ккал</s>\n"
+                f"Удалено. Сегодня: {log.total_kcal:.0f} ккал · белок {log.total_protein:.0f} г")
+        try:
+            await query.edit_message_text(note, parse_mode="HTML")
+        except BadRequest:
+            await query.message.reply_text(strip_tags(note))
+        return
+
+    if action == "fix":
+        context.user_data["fixing_meal"] = {"date": date_str, "id": meal_id}
+        await query.answer()
+        await query.message.reply_text(
+            f"✏️ What should I change about “{meal.get('name', 'this meal')}”?\n\n"
+            "e.g. “it was 2 eggs, not 3”, “cooked in 1 tbsp butter”, “half the rice”, “no sauce”."
+            if lang == "en" else
+            f"✏️ Что изменить в «{meal.get('name', 'этом блюде')}»?\n\n"
+            "например: «яиц было 2, а не 3», «жарила на 1 ст. л. сливочного масла», «риса в два раза меньше».",
+        )
+
+
+# ── Today's meals / summary / targets ────────────────────────────────────────
+def _status(value: float, lo: float, hi: float, higher_is_ok: bool = False) -> str:
+    if lo <= value <= hi:
+        return "🟢"
+    if higher_is_ok and value > hi:
+        return "🟢"
+    gap = (lo - value) / lo if value < lo else (value - hi) / hi
+    return "🟡" if gap <= 0.1 else "🔴"
+
+
+def render_totals(log, targets: dict, day_type: str, lang: str) -> str:
+    dt = ("🏋️ Training day" if day_type == DAY_TYPE_TRAINING else "😴 Rest day") if lang == "en" else \
+         ("🏋️ Тренировочный день" if day_type == DAY_TYPE_TRAINING else "😴 День отдыха")
+    names = {"en": ("Calories", "Protein", "Carbs", "Fat", "Fibre"),
+             "ru": ("Калории", "Белок", "Углеводы", "Жиры", "Клетчатка")}[lang if lang in ("en", "ru") else "en"]
+    rows = [
+        (names[0], log.total_kcal, targets["kcal_min"], targets["kcal_max"], "kcal", False),
+        (names[1], log.total_protein, targets["protein_min"], targets["protein_max"], "g", True),
+        (names[2], log.total_carbs, targets["carbs_min"], targets["carbs_max"], "g", False),
+        (names[3], log.total_fat, targets["fat_min"], targets["fat_max"], "g", False),
+    ]
+    lines = [f"<b>{dt}</b>"]
+    for label, val, lo, hi, unit, hi_ok in rows:
+        lines.append(f"{_status(val, lo, hi, hi_ok)} {label}: <b>{val:.0f}</b> / {lo}–{hi} {unit}")
+    if log.total_fibre:
+        lines.append(f"{'🟢' if log.total_fibre >= 25 else '🟡'} {names[4]}: <b>{log.total_fibre:.0f}</b> / 25+ g")
+    return "\n".join(lines)
+
+
+async def show_today(update: Update, profile) -> None:
+    user_id = update.effective_user.id
+    lang = lang_of(profile)
+    log = get_today_log(user_id)
+    if not log.meals:
+        await update.message.reply_text(t("no_meals", lang))
+        return
+    day_type = current_day_type(user_id, log)
+    targets = get_targets(day_type, profile)
+    lines = ["📋 <b>" + ("Today's meals" if lang == "en" else "Приёмы пищи сегодня") + "</b>", ""]
+    for m in log.meals:
+        lines.append(f"{m['meal_num']}. {meal_ai.e(m.get('time', ''))} <b>{meal_ai.e(m.get('name') or 'Meal')}</b> — "
+                     f"{m.get('kcal', 0):.0f} kcal · P {m.get('protein', 0):.0f}")
+    lines += ["", render_totals(log, targets, day_type, lang)]
+    rows = [[
+        InlineKeyboardButton(f"✏️ {m['meal_num']}", callback_data=f"meal|fix|{log.date}|{m['id']}"),
+        InlineKeyboardButton(f"🗑 {m['meal_num']}", callback_data=f"meal|del|{log.date}|{m['id']}"),
+    ] for m in log.meals[-8:]]
+    await send_html(update.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def show_summary(update: Update, profile) -> None:
+    user_id = update.effective_user.id
+    lang = lang_of(profile)
+    log = get_today_log(user_id)
+    if not log.meals:
+        await update.message.reply_text(t("no_meals", lang))
+        return
+    day_type = current_day_type(user_id, log)
+    targets = get_targets(day_type, profile)
+    header = "📊 <b>" + ("Daily Summary" if lang == "en" else "Сводка за день") + "</b>\n\n" + \
+             render_totals(log, targets, day_type, lang)
+    status = await update.message.reply_text(t("generating", lang))
+    try:
+        workout_note = ""
+        from fitness_storage import get_workout_log
+        wl = get_workout_log(user_id)
+        if wl:
+            workout_note = f"logged {wl.type}: {wl.workout_day or wl.activity_type} {wl.duration_min or ''} min".strip()
+        prompt = build_summary_prompt(log, targets, profile, day_type=day_type, workout_note=workout_note)
+        coaching = call_claude(prompt, max_tokens=700)
+        body = header + "\n\n" + md_to_tg_html(coaching)
+    except Exception as err:
+        logger.exception("Summary failed: %s", err)
+        body = header
+    await send_html(status, body, edit=True)
+
+
+def _targets_text(profile, lang: str) -> str:
+    out = ["🎯 <b>" + ("Your daily targets" if lang == "en" else "Ваши дневные цели") + "</b>", ""]
+    for dt in (DAY_TYPE_TRAINING, DAY_TYPE_REST):
+        tg = get_targets(dt, profile)
+        label = ("🏋️ Training day" if dt == DAY_TYPE_TRAINING else "😴 Rest day") if lang == "en" else \
+                ("🏋️ Тренировочный день" if dt == DAY_TYPE_TRAINING else "😴 День отдыха")
+        src = ("custom" if tg.get("custom") else "auto") if lang == "en" else ("вручную" if tg.get("custom") else "авто")
+        out.append(f"<b>{label}</b> <i>({src})</i>")
+        out.append(f"  {tg['kcal_min']}–{tg['kcal_max']} kcal · P {tg['protein_min']}–{tg['protein_max']} g · "
+                   f"C {tg['carbs_min']}–{tg['carbs_max']} g · F {tg['fat_min']}–{tg['fat_max']} g")
+    out += ["", ("<i>Auto = calculated from your age, sex, height, weight and goal. "
+                 "Carbs fill whatever calories are left after protein and fat.</i>") if lang == "en" else
+                ("<i>Авто — расчёт по возрасту, полу, росту, весу и цели. "
+                 "Углеводы заполняют оставшиеся калории после белка и жиров.</i>")]
+    return "\n".join(out)
+
+
+def targets_buttons(lang: str) -> InlineKeyboardMarkup:
+    en = lang == "en"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Training day" if en else "✏️ Тренировка", callback_data="tgt|set|training"),
+         InlineKeyboardButton("✏️ Rest day" if en else "✏️ Отдых", callback_data="tgt|set|rest")],
+        [InlineKeyboardButton("↺ Use auto-calculated" if en else "↺ Вернуть авто", callback_data="tgt|auto|all")],
+    ])
+
+
+async def show_targets(update: Update, profile) -> None:
+    lang = lang_of(profile)
+    await send_html(update.message, _targets_text(profile, lang), reply_markup=targets_buttons(lang))
+
+
+async def on_targets_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    profile = get_profile(user_id)
+    lang = lang_of(profile)
+    await query.answer()
+    if not profile:
+        return
+    _, action, which = query.data.split("|", 2)
+    if action == "auto":
+        profile.custom_targets = {}
+        save_profile(user_id, profile)
+        await query.edit_message_text(_targets_text(profile, lang), parse_mode="HTML",
+                                      reply_markup=targets_buttons(lang))
+        return
+    context.user_data["setting_targets"] = which
+    label = ("training" if which == "training" else "rest") if lang == "en" else \
+            ("тренировочного" if which == "training" else "дня отдыха")
+    await query.message.reply_text(
+        f"Send your {label} day calories and protein, e.g. <code>1750 120</code>\n"
+        "Optionally add fat in grams: <code>1750 120 55</code>"
+        if lang == "en" else
+        f"Отправьте калории и белок для {label} дня, например <code>1750 120</code>\n"
+        "Можно добавить жиры в граммах: <code>1750 120 55</code>",
+        parse_mode="HTML",
+    )
+
+
+async def save_custom_targets(update: Update, context: ContextTypes.DEFAULT_TYPE, profile, text: str) -> bool:
+    """Handle the reply after tapping ✏️ in Targets. Returns True if handled."""
+    which = context.user_data.get("setting_targets")
+    if not which:
+        return False
+    lang = lang_of(profile)
+    nums = [float(n.replace(",", ".")) for n in re.findall(r"\d+(?:[.,]\d+)?", text)]
+    if len(nums) < 2 or not (800 <= nums[0] <= 5000) or not (30 <= nums[1] <= 350) or \
+            (len(nums) > 2 and not (20 <= nums[2] <= 200)):
+        await update.message.reply_text(
+            "Please send two numbers like 1750 120 (calories, protein g), optionally fat: 1750 120 55"
+            if lang == "en" else
+            "Отправьте два числа, например 1750 120 (калории, белок г), можно добавить жиры: 1750 120 55")
+        return True
+    custom = {"kcal": int(nums[0]), "protein": int(nums[1])}
+    if len(nums) > 2:
+        custom["fat"] = int(nums[2])
+    profile.custom_targets = dict(profile.custom_targets or {})
+    profile.custom_targets[which] = custom
+    save_profile(update.effective_user.id, profile)
+    context.user_data.pop("setting_targets", None)
+    await send_html(update.message, "✅ " + _targets_text(profile, lang),
+                    reply_markup=targets_buttons(lang))
+    return True
 
 
 # ── Fitness Claude API calls ──────────────────────────────────────────────────
@@ -747,32 +1127,7 @@ async def handle_weekly_plan(update: Update, context: ContextTypes.DEFAULT_TYPE)
     fitness_profile.weeks_completed += 1
     save_fitness_profile(user_id, fitness_profile)
 
-    # Telegram max message length is 4096 chars — split if needed
-    try:
-        if len(plan_text) <= 4000:
-            await status.edit_text(plan_text, parse_mode="Markdown")
-        else:
-            await status.delete()
-            # Split on day separators to keep days together
-            chunks = []
-            current = ""
-            for line in plan_text.split("\n"):
-                if len(current) + len(line) + 1 > 3800 and current:
-                    chunks.append(current.strip())
-                    current = line + "\n"
-                else:
-                    current += line + "\n"
-            if current.strip():
-                chunks.append(current.strip())
-            for chunk in chunks:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
-    except Exception as e:
-        logger.error("Error sending plan: %s", e)
-        # Fallback: send without markdown
-        try:
-            await status.edit_text(plan_text[:4000])
-        except Exception:
-            await update.message.reply_text(plan_text[:4000])
+    await send_ai_text(status, plan_text, edit=True)
 
 
 async def handle_log_workout_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -822,6 +1177,7 @@ async def handle_log_workout_text(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error("Claude error logging workout: %s", e)
         await status.edit_text("⚠️ Error logging workout. Please try again.")
+        await update.message.reply_text("🏋️", reply_markup=fitness_keyboard(lang))
         return ConversationHandler.END
 
     # Extract and save workout data
@@ -843,7 +1199,10 @@ async def handle_log_workout_text(update: Update, context: ContextTypes.DEFAULT_
             save_weekly_plan(user_id, current_plan)
 
     clean = re.sub(r"<workout_data>.*?</workout_data>", "", response, flags=re.DOTALL).strip()
-    await status.edit_text(clean, parse_mode="Markdown", reply_markup=fitness_keyboard(lang))
+    if workout_data:
+        set_day_type(user_id, DAY_TYPE_TRAINING)
+    await status.delete()
+    await send_ai_text(update.message, clean, reply_markup=fitness_keyboard(lang))
     return ConversationHandler.END
 
 
@@ -908,7 +1267,8 @@ async def handle_log_activity_text(update: Update, context: ContextTypes.DEFAULT
         save_workout_log(user_id, log)
 
     clean = re.sub(r"<activity_data>.*?</activity_data>", "", response, flags=re.DOTALL).strip()
-    await status.edit_text(clean, parse_mode="Markdown", reply_markup=fitness_keyboard(lang))
+    await status.delete()
+    await send_ai_text(update.message, clean, reply_markup=fitness_keyboard(lang))
     return ConversationHandler.END
 
 
@@ -931,7 +1291,7 @@ async def handle_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     prompt = build_progress_prompt(fitness_profile, profile, recent_weeks, recent_logs, lang)
     try:
         response = call_claude(prompt, max_tokens=800)
-        await status.edit_text(response, parse_mode="Markdown")
+        await send_ai_text(status, response, edit=True)
     except Exception as e:
         logger.error("Progress error: %s", e)
         await status.edit_text("⚠️ Error. Please try again.")
@@ -1011,7 +1371,8 @@ async def checkin_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     record_checkin(user_id, weight, notes, response)
-    await status.edit_text(response, parse_mode="Markdown", reply_markup=home_keyboard(lang))
+    await status.delete()
+    await send_ai_text(update.message, response, reply_markup=home_keyboard(lang))
     return ConversationHandler.END
 
 
@@ -1118,39 +1479,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # ── Nutrition keyboard buttons ────────────────────────────────────────────
     summary_texts  = {"📊 Daily Summary", "📊 Сводка за день"}
+    today_texts    = {"📋 Today's Meals", "📋 Приёмы пищи"}
+    targets_texts  = {"🎯 Targets", "🎯 Цели"}
     training_texts = {"🏋️ Training Day", "🏋️ День тренировки"}
     rest_texts     = {"😴 Rest Day", "😴 День отдыха"}
     reset_texts    = {"🔄 Reset Today", "🔄 Сбросить день"}
     undo_texts     = {"↩️ Undo Last Entry", "↩️ Отменить запись"}
+    all_buttons = summary_texts | today_texts | targets_texts | training_texts | rest_texts | reset_texts | undo_texts
 
-    if text in summary_texts:
+    if text in all_buttons:
+        # Tapping any menu button cancels a pending fix / target edit
+        context.user_data.pop("fixing_meal", None)
+        context.user_data.pop("setting_targets", None)
         if not profile or not profile.is_complete():
             await update.message.reply_text(t("setup_first", lang))
             return
-        day_log = get_today_log(user_id)
-        day_type = context.user_data.get("day_type", DAY_TYPE_TRAINING)
-        if day_log.meal_count == 0:
-            await update.message.reply_text(t("no_meals", lang))
-            return
-        await update.message.reply_text(t("generating", lang))
-        summary = get_daily_summary(day_log, day_type, profile)
-        await update.message.reply_text(summary, parse_mode="Markdown")
+
+    if text in summary_texts:
+        await show_summary(update, profile)
         return
 
-    if text in training_texts:
-        context.user_data["day_type"] = DAY_TYPE_TRAINING
-        targets = get_targets(DAY_TYPE_TRAINING, profile)
-        await update.message.reply_text(
-            f"{t('training_set', lang)}\n{t('calories', lang)}: {targets['kcal_min']}–{targets['kcal_max']} kcal | {t('protein', lang)}: {targets['protein_max']}g",
-            parse_mode="Markdown", reply_markup=main_keyboard(lang),
-        )
+    if text in today_texts:
+        await show_today(update, profile)
         return
 
-    if text in rest_texts:
-        context.user_data["day_type"] = DAY_TYPE_REST
-        targets = get_targets(DAY_TYPE_REST, profile)
+    if text in targets_texts:
+        await show_targets(update, profile)
+        return
+
+    if text in training_texts or text in rest_texts:
+        day_type = DAY_TYPE_TRAINING if text in training_texts else DAY_TYPE_REST
+        set_day_type(user_id, day_type)
+        targets = get_targets(day_type, profile)
+        log = get_today_log(user_id)
         await update.message.reply_text(
-            f"{t('rest_set', lang)}\n{t('calories', lang)}: {targets['kcal_min']}–{targets['kcal_max']} kcal | {t('protein', lang)}: {targets['protein_max']}g",
+            f"{t('training_set' if day_type == DAY_TYPE_TRAINING else 'rest_set', lang)}\n"
+            f"{t('calories', lang)}: {log.total_kcal:.0f} / {targets['kcal_min']}–{targets['kcal_max']} kcal | "
+            f"{t('protein', lang)}: {log.total_protein:.0f} / {targets['protein_max']}g",
             parse_mode="Markdown", reply_markup=main_keyboard(lang),
         )
         return
@@ -1166,18 +1531,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text(t("undo_empty", lang), reply_markup=main_keyboard(lang))
         else:
             log = get_today_log(user_id)
-            label = removed.get("label") or f"Meal {removed.get('meal_num', '?')}"
+            label = removed.get("name") or removed.get("label") or f"Meal {removed.get('meal_num', '?')}"
             msg = t("undo_success", lang).format(
-                label=label, kcal=removed["kcal"], protein=removed["protein"],
-                carbs=removed["carbs"], fat=removed["fat"],
+                label=label.replace("*", ""), kcal=removed.get("kcal", 0), protein=removed.get("protein", 0),
+                carbs=removed.get("carbs", 0), fat=removed.get("fat", 0),
                 total_kcal=log.total_kcal, total_protein=log.total_protein,
             )
             await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_keyboard(lang))
         return
 
-    # ── Meal logging (photo or text in nutrition section) ─────────────────────
+    # ── Everything else is a meal (photo, image file, or text) ────────────────
     if not profile or not profile.is_complete():
         await update.message.reply_text(t("setup_first", lang))
+        return
+
+    # Waiting for new custom targets?
+    if update.message.text and await save_custom_targets(update, context, profile, update.message.text):
+        return
+
+    # Correction: after tapping ✏️ Fix, or replying to a logged-meal message
+    fixing = context.user_data.pop("fixing_meal", None)
+    if not fixing and update.message.reply_to_message and update.message.text:
+        found = find_meal_by_message(user_id, update.message.reply_to_message.message_id)
+        if found:
+            fixing = {"date": found[0].date, "id": found[1]["id"]}
+    if fixing and update.message.text:
+        await apply_correction(update, context, profile, fixing["date"], fixing["id"], update.message.text)
         return
 
     is_blocked, trial = record_and_check_trial(user_id)
@@ -1187,40 +1566,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if trial.days_remaining() in (1, 2) and not trial.paid:
         await update.message.reply_text(t("trial_warning", lang).format(days=trial.days_remaining()), parse_mode="Markdown")
 
-    image_b64 = None
+    image_file_id, media_type = None, "image/jpeg"
     if update.message.photo:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        file_bytes = await file.download_as_bytearray()
-        image_b64 = base64.b64encode(file_bytes).decode("utf-8")
-    elif not text:
+        image_file_id = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        image_file_id = update.message.document.file_id
+        media_type = update.message.document.mime_type
+        if media_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            media_type = "image/jpeg"
+    elif not text.strip():
         await update.message.reply_text(t("send_meal", lang))
         return
 
-    day_type = context.user_data.get("day_type", DAY_TYPE_TRAINING)
-    day_log = get_today_log(user_id)
-    status_msg = await update.message.reply_text(t("analysing", lang))
-
-    try:
-        response_text = analyse_meal(image_b64, text, day_log, day_type, profile)
-    except Exception as e:
-        logger.error("Claude API error: %s", e)
-        await status_msg.edit_text(t("analyse_error", lang))
-        return
-
-    macros = extract_macros_from_response(response_text)
-    if macros:
-        day_log.add_meal(kcal=macros.get("kcal", 0), protein=macros.get("protein", 0),
-                         carbs=macros.get("carbs", 0), fat=macros.get("fat", 0))
-        save_log(user_id, day_log)
-
-    clean = re.sub(r"<macros>.*?</macros>", "", response_text, flags=re.DOTALL).strip()
-    await status_msg.edit_text(clean, parse_mode="Markdown")
+    await log_meal(update, context, profile, image_file_id=image_file_id,
+                   media_type=media_type, description=text.strip())
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
-    from pathlib import Path
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = Application.builder().token(token).build()
     app.bot_data["data_dir"] = os.getenv("DATA_DIR", "data")
@@ -1233,6 +1596,7 @@ def main() -> None:
             ASK_SEX:         [MessageHandler(filters.TEXT & ~filters.COMMAND, onboard_sex)],
             ASK_AGE:         [MessageHandler(filters.TEXT & ~filters.COMMAND, onboard_age)],
             ASK_WEIGHT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, onboard_weight)],
+            ASK_HEIGHT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, onboard_height)],
             ASK_GOAL:        [MessageHandler(filters.TEXT & ~filters.COMMAND, onboard_goal)],
             FIT_ENV:         [MessageHandler(filters.TEXT & ~filters.COMMAND, fit_onboard_env)],
             FIT_LEVEL:       [MessageHandler(filters.TEXT & ~filters.COMMAND, fit_onboard_level)],
@@ -1252,6 +1616,7 @@ def main() -> None:
             EDIT_SEX:    [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sex)],
             EDIT_AGE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_age)],
             EDIT_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_weight)],
+            EDIT_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_height)],
             EDIT_GOAL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_goal)],
         },
         fallbacks=[CommandHandler("cancel", onboard_cancel)],
@@ -1296,8 +1661,13 @@ def main() -> None:
     app.add_handler(checkin_conv)
     app.add_handler(CommandHandler("whitelist", cmd_whitelist))
     app.add_handler(CommandHandler("checkin", checkin_start))
+    app.add_handler(CallbackQueryHandler(on_meal_button, pattern=r"^meal\|"))
+    app.add_handler(CallbackQueryHandler(on_targets_button, pattern=r"^tgt\|"))
     app.add_handler(
-        MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE | (filters.TEXT & ~filters.COMMAND),
+            handle_message,
+        )
     )
 
     # Daily job to check if monthly check-in reminders should be sent
